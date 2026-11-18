@@ -10,8 +10,13 @@ import traceback
 from subprocess import PIPE, run
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+# Some geoBoundaries files (e.g. CAN, PHL) contain single GeoJSON features larger than
+# GDAL's default 200 MB object limit; without this, reading them fails.
+os.environ.setdefault("OGR_GEOJSON_MAX_OBJ_SIZE", "0")
+
 import geopandas as gpd
 import pandas as pd
+import shapely
 
 # Ignore warnings about using '()' in str.contains
 warnings.filterwarnings("ignore", "This pattern has match groups")
@@ -274,6 +279,15 @@ GAP_FILL_MIN_CORE_KM2 = 1
 # the parent's area. This keeps lakes and coastline differences (typically well below 1%)
 # out, while real gaps (merged territories, URY municipios) are far above it.
 GAP_FILL_MIN_FRACTION = 0.05
+# Gaps are detected on geometries simplified with this tolerance (m), which keeps memory
+# use acceptable for very detailed layers (e.g. CAN ADM1 is ~650 MB). The geometry of
+# each filled part is then computed exactly from the original features around it.
+GAP_FILL_SIMPLIFY_M = 100
+
+
+def _simplified(geoseries):
+    """Simplified, valid copy of a projected GeoSeries, used only for gap detection."""
+    return geoseries.simplify(GAP_FILL_SIMPLIFY_M, preserve_topology=False).make_valid()
 
 
 def _union(geoseries):
@@ -315,20 +329,33 @@ def fill_coverage_gaps(level_path, parents, adm_level, iso, clip_to=None):
     if parents.crs is None:
         parents = parents.set_crs("EPSG:4326")
     parents_p = parents.to_crs(GAP_FILL_CRS)
-    parents_p["geometry"] = parents_p.geometry.make_valid()
+    parents_s = _simplified(parents_p.geometry)
+    clip_p = None
     if clip_to is not None and not clip_to.empty:
         clip_crs = clip_to if clip_to.crs is not None else clip_to.set_crs("EPSG:4326")
-        clip_geom = _union(clip_crs.to_crs(GAP_FILL_CRS).geometry.make_valid())
-        parents_p["geometry"] = parents_p.geometry.intersection(clip_geom)
+        clip_p = clip_crs.to_crs(GAP_FILL_CRS).geometry
+        parents_s = parents_s.intersection(_union(_simplified(clip_p)))
 
-    if level.empty:
-        covered = None
-    else:
-        covered = _union(level.to_crs(GAP_FILL_CRS).geometry.make_valid())
+    level_p = level.to_crs(GAP_FILL_CRS).geometry if not level.empty else None
+    covered = _union(_simplified(level_p)) if level_p is not None else None
+
+    def exact_fill(part, parent_geom):
+        """Exact gap geometry around an approximate (simplified) gap part."""
+        window = part.buffer(2 * GAP_FILL_SIMPLIFY_M)
+        box = window.bounds
+        region = shapely.clip_by_rect(parent_geom, *box)
+        if clip_p is not None:
+            region = region.intersection(_union(clip_p.clip_by_rect(*box).make_valid()))
+        region = shapely.make_valid(region).intersection(window)
+        if level_p is not None:
+            near = level_p.iloc[level_p.sindex.query(window, predicate="intersects")]
+            if len(near):
+                region = region.difference(_union(near.clip_by_rect(*box).make_valid()))
+        return region
 
     additions = []
-    for _, parent in parents_p.iterrows():
-        geom = parent.geometry
+    for idx, parent in parents_p.iterrows():
+        geom = parents_s.loc[idx]
         if geom is None or geom.is_empty:
             continue
         uncovered = geom if covered is None else geom.difference(covered)
@@ -342,9 +369,21 @@ def fill_coverage_gaps(level_path, parents, adm_level, iso, clip_to=None):
         ]
         if not keep:
             continue
-        fill_geom = _union(gpd.GeoSeries(keep, crs=GAP_FILL_CRS))
-        if fill_geom.area < GAP_FILL_MIN_FRACTION * geom.area:
+        if sum(p.area for p in keep) < GAP_FILL_MIN_FRACTION * geom.area:
+            # Small total gap: only fill detached parts (islands that do not touch any
+            # existing feature, e.g. the southern Kuril Islands, which LSIB assigns to
+            # JPN but JPN ADM1/ADM2 do not contain). Parts touching existing features
+            # are lakes or coastline differences and are left as they are.
+            keep = [p for p in keep if covered is None or not p.intersects(covered)]
+            if not keep:
+                continue
+        exact = [exact_fill(p, shapely.make_valid(parent.geometry)) for p in keep]
+        fill_geom = _union(gpd.GeoSeries(exact, crs=GAP_FILL_CRS))
+        if fill_geom.is_empty:
             continue
+        if fill_geom.geom_type == "GeometryCollection":
+            fill_geom = _union(gpd.GeoSeries(
+                [g for g in fill_geom.geoms if g.geom_type in ("Polygon", "MultiPolygon")], crs=GAP_FILL_CRS))
         additions.append({
             "shapeName": parent.get("shapeName", "") or "",
             "shapeISO": "",
