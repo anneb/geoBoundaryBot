@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import sys
 import warnings
 import datetime
@@ -173,6 +174,9 @@ def preprocess_dta():
         country_na = [v for k, v in test_dict.items() if k in country_na] + default
         return country_na[0]
 
+    # Keep the original LSIB name (e.g. "French Guiana (Fr)") so territories that are
+    # merged into their parent can still be named when filling coverage gaps.
+    G["LSIB_NAME"] = G.COUNTRY_NA
     G.COUNTRY_NA = G.COUNTRY_NA.map(country_renamer)
 
     # Add ISO codes
@@ -255,6 +259,113 @@ def preprocess_dta():
 
     G.to_file("./baseISO.geojson", driver="GeoJSON")
     disputedG.to_file("./disputedISO.geojson", driver="GeoJSON")
+
+
+# Coverage-gap filling (see fill_coverage_gaps).
+# Equal-area projection used for area and width tests.
+GAP_FILL_CRS = "ESRI:54009"  # World Mollweide
+# Uncovered parts narrower than ~2x this width are treated as border slivers caused by
+# small differences between LSIB and geoBoundaries borders, and are left to mapshaper's
+# -clean gap-fill. Wider parts are real coverage gaps.
+GAP_FILL_MIN_WIDTH_M = 1000
+# Minimum area (km2) that must remain after the negative buffer for a part to be filled.
+GAP_FILL_MIN_CORE_KM2 = 1
+# A parent is only filled if its uncovered (non-sliver) area is at least this fraction of
+# the parent's area. This keeps lakes and coastline differences (typically well below 1%)
+# out, while real gaps (merged territories, URY municipios) are far above it.
+GAP_FILL_MIN_FRACTION = 0.05
+
+
+def _union(geoseries):
+    """Union of a GeoSeries; works on both old (unary_union) and new (union_all) geopandas."""
+    if hasattr(geoseries, "union_all"):
+        return geoseries.union_all()
+    return geoseries.unary_union
+
+
+def clean_lsib_name(name):
+    """Strip LSIB suffixes like ' (Fr)' or ' [Caribbean]' from a country/territory name."""
+    if not isinstance(name, str):
+        return ""
+    return re.sub(r"\s*[\(\[][^\)\]]*[\)\]]\s*$", "", name).strip()
+
+
+def fill_coverage_gaps(level_path, parents, adm_level, iso, clip_to=None):
+    """Add features for parts of `parents` that are not covered by the features in `level_path`.
+
+    `parents` is a GeoDataFrame (EPSG:4326) of the next higher level with a `shapeName`
+    column. If `clip_to` (GeoDataFrame, EPSG:4326) is given, parents are first clipped to
+    it, so filling never extends beyond the CGAZ ADM0 geometry. For every parent whose
+    uncovered area is at least GAP_FILL_MIN_FRACTION of its area, the uncovered parts
+    that are wider than a border sliver become one new feature named after the parent.
+    The file at `level_path` is rewritten only if something was added; it is created
+    if it does not exist yet. Returns the number of features added.
+    """
+    if parents is None or parents.empty:
+        return 0
+
+    if os.path.isfile(level_path):
+        level = gpd.read_file(level_path)
+    else:
+        level = gpd.GeoDataFrame(columns=["shapeName", "shapeISO", "shapeID", "shapeGroup", "shapeType", "geometry"], geometry="geometry", crs="EPSG:4326")
+    if level.crs is None:
+        level = level.set_crs("EPSG:4326")
+
+    parents = parents.copy()
+    if parents.crs is None:
+        parents = parents.set_crs("EPSG:4326")
+    parents_p = parents.to_crs(GAP_FILL_CRS)
+    parents_p["geometry"] = parents_p.geometry.make_valid()
+    if clip_to is not None and not clip_to.empty:
+        clip_crs = clip_to if clip_to.crs is not None else clip_to.set_crs("EPSG:4326")
+        clip_geom = _union(clip_crs.to_crs(GAP_FILL_CRS).geometry.make_valid())
+        parents_p["geometry"] = parents_p.geometry.intersection(clip_geom)
+
+    if level.empty:
+        covered = None
+    else:
+        covered = _union(level.to_crs(GAP_FILL_CRS).geometry.make_valid())
+
+    additions = []
+    for _, parent in parents_p.iterrows():
+        geom = parent.geometry
+        if geom is None or geom.is_empty:
+            continue
+        uncovered = geom if covered is None else geom.difference(covered)
+        if uncovered.is_empty:
+            continue
+        parts = gpd.GeoSeries([uncovered], crs=GAP_FILL_CRS).explode(index_parts=False)
+        parts = parts[parts.geom_type == "Polygon"]
+        keep = [
+            p for p in parts
+            if p.buffer(-GAP_FILL_MIN_WIDTH_M).area / 1e6 >= GAP_FILL_MIN_CORE_KM2
+        ]
+        if not keep:
+            continue
+        fill_geom = _union(gpd.GeoSeries(keep, crs=GAP_FILL_CRS))
+        if fill_geom.area < GAP_FILL_MIN_FRACTION * geom.area:
+            continue
+        additions.append({
+            "shapeName": parent.get("shapeName", "") or "",
+            "shapeISO": "",
+            "shapeID": f"{iso}-{adm_level}-FILL-{len(additions) + 1}",
+            "shapeGroup": iso,
+            "shapeType": adm_level,
+            "geometry": fill_geom,
+        })
+        logger.info(
+            f"Coverage gap filled for {iso} {adm_level}: '{additions[-1]['shapeName']}' "
+            f"({fill_geom.area / 1e6:.0f} km2 not covered by geoBoundaries {adm_level})"
+        )
+
+    if not additions:
+        return 0
+
+    added = gpd.GeoDataFrame(additions, geometry="geometry", crs=GAP_FILL_CRS).to_crs("EPSG:4326")
+    result = pd.concat([level, added], ignore_index=True)
+    result = gpd.GeoDataFrame(result, geometry="geometry", crs="EPSG:4326")
+    result.to_file(level_path, driver="GeoJSON")
+    return len(additions)
 
 
 def process_geometry_wrapper(args, adm0):
@@ -401,15 +512,39 @@ def process_geometry(args, adm0, adm0str, adm1str, adm2str):
         adm1out = os.path.join(outPath, f"ADM1_{curISO}.geojson")
         adm2out = os.path.join(outPath, f"ADM2_{curISO}.geojson")
         
+        # Remove stale outputs from earlier runs, so they are never picked up by accident
+        for stale in (adm1out, adm2out):
+            if os.path.isfile(stale):
+                os.remove(stale)
+
         # Process with mapshaper if input files exist
         if os.path.isfile(A1Path):
             cmd(f"mapshaper-xl {A1Path} -o format=geojson {adm1out}")
-            adm1str += " " + adm1out
-            
+
         if os.path.isfile(A2Path):
             cmd(f"mapshaper-xl {A2Path} -o format=geojson {adm2out}")
+
+        # The ADM0 (LSIB) geometry can be larger than what the geoBoundaries ADM1/ADM2
+        # files cover: territories such as French Guiana (Fr) are merged into their
+        # parent (FRA) while FRA's ADM1/ADM2 only cover metropolitan France, and some
+        # ADM2 layers (e.g. URY municipios) do not cover the whole country by design.
+        # Fill those parts from the next higher level so CGAZ ADM1/ADM2 have no holes.
+        # Failures here must not drop the whole country, so fall back to the unfilled files.
+        try:
+            lsib_parents = g.copy()
+            name_col = "LSIB_NAME" if "LSIB_NAME" in lsib_parents.columns else "COUNTRY_NA"
+            lsib_parents["shapeName"] = lsib_parents[name_col].map(clean_lsib_name)
+            fill_coverage_gaps(adm1out, lsib_parents, "ADM1", curISO)
+            if os.path.isfile(adm1out):
+                fill_coverage_gaps(adm2out, gpd.read_file(adm1out), "ADM2", curISO, clip_to=g)
+        except Exception as e:
+            logger.error(f"Coverage gap filling failed for {curISO}, continuing without it: {str(e)}")
+
+        if os.path.isfile(adm1out):
+            adm1str += " " + adm1out
+        if os.path.isfile(adm2out):
             adm2str += " " + adm2out
-        
+
         adm0str += " " + DTA_A0Path
         logger.debug(f"Completed processing ADM0: {adm0}")
         return adm0str, adm1str, adm2str
